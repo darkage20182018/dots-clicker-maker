@@ -232,6 +232,8 @@
         letter-spacing: 0.05em; color: var(--accent); padding-top: 2px;
       }
       .foot { font-size: 12px; color: var(--muted); line-height: 1.6; border-top: 1px solid var(--line); margin-top: 16px; padding-top: 12px; }
+      .photo-log { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 4px; font-size: 12.5px; color: var(--muted); line-height: 1.5; }
+      .alert a { color: inherit; font-weight: 700; }
 
       @media (max-width: 900px) {
         body { grid-template-columns: 1fr; grid-template-rows: 54dvh minmax(0, 1fr); }
@@ -244,8 +246,8 @@
       <canvas id="gl"></canvas>
       <div id="dropHint">
         <div class="big">Turn any model into a two-part fidget clicker</div>
-        <div class="small">Drop an STL or OBJ anywhere in this window — or start from a photo instead. The snap-click cutter is placed inside, the model is split in two, and both halves come out ready to print.</div>
-        <div class="keys"><span class="key">STL · binary &amp; ASCII</span><span class="key">OBJ</span><span class="key">PNG · JPG → relief plaque</span><span class="key">Millimetres</span><span class="key">Runs 100% in your browser</span></div>
+        <div class="small">Drop an STL or OBJ anywhere in this window — or start from a photo instead: as a relief plaque, or as a full 3D model built by a free AI Space. The snap-click cutter is placed inside, the model is split in two, and both halves come out ready to print.</div>
+        <div class="keys"><span class="key">STL · binary &amp; ASCII</span><span class="key">OBJ</span><span class="key">PNG · JPG → relief plaque</span><span class="key">Photo → full 3D · free AI</span><span class="key">Millimetres</span></div>
       </div>
       <div class="view-tools">
         <button class="tool-btn" id="resetViewBtn" type="button">Reset view</button>
@@ -281,7 +283,28 @@
           <button class="btn" id="openImgBtn" type="button">Open image → relief clicker…</button>
         </div>
         <input type="file" id="imgInput" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" hidden />
-        <div class="file-meta" id="fileMeta">No model loaded yet. Files are read as millimetres and never leave this browser — all cutting happens locally.</div>
+        <div class="row" style="margin-top:8px">
+          <button class="btn" id="photoBtn" type="button">Photo → full 3D (free AI)…</button>
+        </div>
+        <input type="file" id="photoInput" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" hidden />
+        <div id="photoPanel" style="display:none; margin-top:14px; border-top:1px dashed var(--line); padding-top:12px">
+          <div style="font-weight:700; font-size:13.5px">Photo → full 3D</div>
+          <p class="note" style="margin-top:4px">Your photo is sent to a free public AI Space on Hugging Face, which rebuilds it as a real 3D model — not a flat relief. The model (GLB) comes back here and is cut like any other model: cutter placed, Regular/Embedded styles, exploded preview, STL export. No account, no API key, nothing to install. It tries TRELLIS.2 first, then Stable Fast 3D, then TripoSR.</p>
+          <p class="note"><b>Free-route limits, honestly:</b> anonymous and free-account use of these Spaces is metered in GPU minutes per day — roughly 1–2 heavy generations per person per day, shared with everyone else on the Space. Spaces also sleep when idle, so a first run can take a few minutes to wake and queue. If one Space refuses, runs out of quota, or the browser blocks the call, the next is tried automatically.</p>
+          <div id="photoStatus" style="display:none; margin-top:10px">
+            <div style="display:flex; gap:10px; align-items:center">
+              <div class="spinner" id="photoSpin" style="width:20px; height:20px; border-width:3px; flex:none" aria-hidden="true"></div>
+              <div id="photoStatusText" style="font-size:13px; font-weight:600; line-height:1.45"></div>
+            </div>
+            <ul class="photo-log" id="photoLog"></ul>
+            <button class="btn" id="photoCancel" type="button" style="margin-top:10px">Cancel generation</button>
+          </div>
+          <div class="alert err" id="photoError"></div>
+          <div class="alert info show" id="photoManual" style="margin-top:10px">
+            <b>Manual route (always works):</b> generate the model on a free web tier — <a href="https://www.meshy.ai/features/image-to-3d" target="_blank" rel="noopener">Meshy</a> or <a href="https://www.tripo3d.ai/" target="_blank" rel="noopener">Tripo</a> — download the <b>STL</b> or <b>OBJ</b>, then open it here with “Open STL / OBJ…” above and cut it the same way.
+          </div>
+        </div>
+        <div class="file-meta" id="fileMeta">No model loaded yet. STL/OBJ files are read as millimetres and never leave this browser — all cutting happens locally. The one exception is Photo → full 3D below, which sends your photo to a free AI Space to build the model.</div>
         <div class="alert err" id="meshError"></div>
         <div class="row" id="fitRow" style="display:none; margin-top:10px">
           <button class="btn" id="fitBtn" type="button">Scale model to fit cutter</button>
@@ -1012,6 +1035,557 @@
         img.src = url;
       }
 
+      /* ================= photo → full 3D (free HF Spaces) =================
+         The photo is sent to a free public Gradio Space on Hugging Face —
+         no account, no API key, and no token anywhere in this page. The
+         Space returns a GLB/OBJ, which is converted locally and fed into
+         the same pipeline as an uploaded model. Free Spaces are metered
+         and sleep when idle, so every step reports live status, and every
+         failure falls through to the next Space, then to a manual route. */
+      var PHOTO_SPACES = [
+        { name: "TRELLIS.2 (Microsoft)", host: "https://microsoft-trellis-2.hf.space", kind: "trellis", budget: 480000 },
+        { name: "Stable Fast 3D (Stability AI)", host: "https://stabilityai-stable-fast-3d.hf.space", kind: "generic", budget: 300000 },
+        { name: "TripoSR (Stability AI)", host: "https://stabilityai-triposr.hf.space", kind: "generic", budget: 300000 }
+      ];
+      var photoGen = null;
+
+      function phFatal(msg) { var e = new Error(msg); e.fatal = true; return e; }
+      function phGuard(att) {
+        if (!photoGen || photoGen.cancelled) throw phFatal("__cancelled__");
+        if (Date.now() > att.deadline) throw phFatal("gave up after " + Math.round(att.space.budget / 60000) + " min — the Space was too slow, asleep, or its queue too long");
+      }
+      function phSleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+      function phHash() { var s = "", ch = "abcdefghijklmnopqrstuvwxyz0123456789"; for (var i = 0; i < 12; i++) s += ch.charAt(Math.floor(Math.random() * ch.length)); return s; }
+      function phElapsed() {
+        if (!photoGen) return "";
+        var s = Math.floor((Date.now() - photoGen.t0) / 1000);
+        return Math.floor(s / 60) + ":" + ("0" + (s % 60)).slice(-2);
+      }
+      function phStatus(txt) {
+        if (!photoGen) return;
+        photoGen.statusBase = txt;
+        $("photoStatusText").textContent = txt + " · " + phElapsed() + " elapsed";
+      }
+      function phLog(txt) {
+        var li = document.createElement("li");
+        li.textContent = txt;
+        $("photoLog").appendChild(li);
+      }
+      function cleanErrText(s) {
+        if (!s) return "";
+        s = String(s);
+        try { var j = JSON.parse(s); if (j && (j.error || j.detail || j.message)) s = String(j.error || j.detail || j.message); } catch (err) {}
+        s = s.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+        if (s.length > 240) s = s.slice(0, 240) + "…";
+        return s;
+      }
+      function phReadable(e) {
+        if (!e) return "unknown error";
+        if (e.fatal) return e.message;
+        if (e.name === "AbortError") return "a request timed out";
+        if (e instanceof TypeError) return "the browser couldn't reach the Space (network or CORS block)";
+        return cleanErrText(e.message || String(e)) || "unknown error";
+      }
+      function phFetch(att, url, opts, timeoutMs) {
+        phGuard(att);
+        var ctl = new AbortController();
+        if (photoGen) photoGen.ctl = ctl;
+        var to = setTimeout(function () { ctl.abort(); }, Math.max(1000, timeoutMs || 60000));
+        var o = { method: (opts && opts.method) || "GET", signal: ctl.signal };
+        if (opts) { if (opts.headers) o.headers = opts.headers; if (opts.body !== undefined) o.body = opts.body; }
+        return fetch(url, o).then(function (res) { clearTimeout(to); return res; }, function (err) { clearTimeout(to); throw err; });
+      }
+      function phParseBlock(block) {
+        var ev = "message", lines = [];
+        block.split("\n").forEach(function (line) {
+          if (line.indexOf("event:") === 0) ev = line.slice(6).trim();
+          else if (line.indexOf("data:") === 0) lines.push(line.slice(5).trim());
+        });
+        return { event: ev, data: lines.join("\n") };
+      }
+      function phReadStream(att, res, onBlock) {
+        var reader = res.body.getReader();
+        var dec = new TextDecoder();
+        var buf = "";
+        function pump() {
+          return reader.read().then(function (r) {
+            phGuard(att);
+            if (r.done) { if (buf.trim()) onBlock(buf); return; }
+            buf += dec.decode(r.value, { stream: true });
+            var idx;
+            while ((idx = buf.indexOf("\n\n")) >= 0) { var b = buf.slice(0, idx); buf = buf.slice(idx + 2); if (b.trim()) onBlock(b); }
+            return pump();
+          });
+        }
+        return pump();
+      }
+      /* Poll a probe path until the Space answers with JSON — Spaces sleep
+         when idle and can take a minute or two to wake. */
+      function phWake(att, probePath) {
+        var wakeDeadline = Math.min(att.deadline, Date.now() + 150000);
+        function tryOnce() {
+          phGuard(att);
+          return phFetch(att, att.space.host + probePath, {}, 25000).then(function (res) {
+            return res.text().then(function (t) {
+              if (/in error/i.test(t) && res.status >= 400) throw phFatal("Hugging Face reports this Space is in an error state right now — it's down, not just asleep");
+              if (res.ok && t.charAt(0) === "{") return true;
+              if (Date.now() > wakeDeadline) throw phFatal("the Space didn't wake up in time — it may be asleep or still building");
+              phStatus(att.space.name + ": waking the Space — free Spaces sleep when idle, this can take a minute or two");
+              return phSleep(8000).then(tryOnce);
+            });
+          }).catch(function (e) {
+            if (e && e.fatal) throw e;
+            if (Date.now() > wakeDeadline) throw phFatal("couldn't reach the Space at all — it may be asleep or down");
+            phStatus(att.space.name + ": waking the Space — free Spaces sleep when idle");
+            return phSleep(8000).then(tryOnce);
+          });
+        }
+        return tryOnce();
+      }
+      function phUpload(att, file, paths) {
+        function tryPath(i) {
+          phGuard(att);
+          if (i >= paths.length) return Promise.reject(new Error("the Space refused the photo upload"));
+          var fd = new FormData();
+          fd.append("files", file, file.name);
+          return phFetch(att, att.space.host + paths[i], { method: "POST", body: fd }, 120000).then(function (res) {
+            if (res.status === 404 || res.status === 405) return tryPath(i + 1);
+            if (!res.ok) throw new Error("the photo upload was refused (HTTP " + res.status + ")");
+            return res.json().then(function (j) {
+              var p = Array.isArray(j) ? j[0] : null;
+              if (p && typeof p === "object") p = p.path || p.url;
+              if (!p) return tryPath(i + 1);
+              return p;
+            });
+          });
+        }
+        return tryPath(0);
+      }
+      /* Gradio 5 named-endpoint protocol: POST /gradio_api/call/<name>
+         returns an event_id; GET on it streams SSE until event: complete. */
+      function phCall(att, apiName, data, session) {
+        var host = att.space.host;
+        return phFetch(att, host + "/gradio_api/call/" + apiName, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ data: data, session_hash: session })
+        }, 120000).then(function (res) {
+          if (!res.ok) return res.text().then(function (t) { throw new Error("the Space refused the job (HTTP " + res.status + "): " + cleanErrText(t)); });
+          return res.json();
+        }).then(function (j) {
+          if (j && j.error) throw new Error(cleanErrText(j.error) || "the Space refused the job");
+          if (!j || !j.event_id) throw new Error("the Space didn't accept the job (no event id came back)");
+          var result = null, failure = null, done = false;
+          return phFetch(att, host + "/gradio_api/call/" + apiName + "/" + j.event_id, {}, Math.max(30000, att.deadline - Date.now())).then(function (res) {
+            if (!res.ok) throw new Error("couldn't follow the job's progress (HTTP " + res.status + ")");
+            return phReadStream(att, res, function (block) {
+              var b = phParseBlock(block);
+              if (b.event === "complete") { done = true; try { result = JSON.parse(b.data); } catch (e) { result = null; } }
+              else if (b.event === "error") failure = (b.data && b.data !== "null") ? cleanErrText(b.data) : "";
+            });
+          }).then(function () {
+            if (failure) { if (/quota/i.test(failure)) failure += " — the free daily GPU allowance for this Space looks used up"; throw new Error(failure); }
+            if (!done) throw new Error("the Space closed the stream before finishing");
+            return result;
+          });
+        });
+      }
+      /* Gradio queue protocol (4.x root paths, 5.x under /gradio_api):
+         POST queue/join, then stream queue/data for this session. */
+      function phQueue(att, fnIndex, data, session, onProgress) {
+        var host = att.space.host;
+        function join(prefix) {
+          return phFetch(att, host + prefix + "/queue/join", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ data: data, fn_index: fnIndex, session_hash: session })
+          }, 60000).then(function (res) {
+            if (res.status === 404) return null;
+            if (!res.ok) return res.text().then(function (t) { throw new Error("the Space refused the job (HTTP " + res.status + "): " + cleanErrText(t)); });
+            return prefix;
+          });
+        }
+        return join("").then(function (p) {
+          if (p !== null) return p;
+          return join("/gradio_api");
+        }).then(function (prefix) {
+          if (prefix === null) throw new Error("couldn't reach this Space's job queue");
+          var result = null, failure = null;
+          return phFetch(att, host + prefix + "/queue/data?session_hash=" + encodeURIComponent(session), {}, Math.max(30000, att.deadline - Date.now())).then(function (res) {
+            if (!res.ok) throw new Error("couldn't follow the job's progress (HTTP " + res.status + ")");
+            return phReadStream(att, res, function (block) {
+              var b = phParseBlock(block);
+              if (!b.data) return;
+              var msg; try { msg = JSON.parse(b.data); } catch (e) { return; }
+              if (msg.msg === "estimation") { if (typeof msg.rank === "number") onProgress("in the queue — position " + (msg.rank + 1)); }
+              else if (msg.msg === "process_starts" || msg.msg === "process_generating") onProgress("generating your model");
+              else if (msg.msg === "queue_full") failure = "the Space's queue is full right now";
+              else if (msg.msg === "process_completed") {
+                if (msg.success === false || !msg.output) failure = cleanErrText(msg.output && msg.output.error) || "generation failed on the Space";
+                else result = msg.output.data;
+              }
+            });
+          }).then(function () {
+            if (failure) { if (/quota/i.test(failure)) failure += " — the free daily GPU allowance for this Space looks used up"; throw new Error(failure); }
+            if (!result) throw new Error("the Space closed the stream before the model was ready");
+            return result;
+          });
+        });
+      }
+      function phFindModelFiles(node, acc) {
+        if (node === null || node === undefined) return;
+        if (typeof node === "string") {
+          if (/\.(glb|gltf|obj|stl)(\?|#|$)/i.test(node)) acc.push({ path: node });
+          return;
+        }
+        if (Array.isArray(node)) { node.forEach(function (n) { phFindModelFiles(n, acc); }); return; }
+        if (typeof node === "object") {
+          var p = node.path || node.url;
+          if (typeof p === "string" && /\.(glb|gltf|obj|stl)(\?|#|$)/i.test(p)) acc.push(node);
+          Object.keys(node).forEach(function (k) { if (k !== "path" && k !== "url") phFindModelFiles(node[k], acc); });
+        }
+      }
+      function phPickFile(files) {
+        var order = ["glb", "obj", "stl", "gltf"];
+        for (var i = 0; i < order.length; i++) {
+          for (var j = 0; j < files.length; j++) {
+            var p = String(files[j].path || files[j].url || "");
+            if (new RegExp("\\." + order[i] + "(\\?|#|$)", "i").test(p)) return files[j];
+          }
+        }
+        return files[0] || null;
+      }
+      function phFmtOf(name) {
+        var m = /\.(glb|gltf|obj|stl)(?:\?|#|$)/i.exec(String(name || ""));
+        return m ? m[1].toLowerCase() : "glb";
+      }
+      function phDownload(att, fileObj) {
+        var p = String(fileObj.path || fileObj.url || "");
+        var urls = [];
+        if (/^https?:\/\//i.test(fileObj.url || "")) urls.push(fileObj.url);
+        if (/^https?:\/\//i.test(p)) urls.push(p);
+        if (p && !/^https?:\/\//i.test(p)) {
+          var rel = p.charAt(0) === "/" ? p : "/" + p;
+          urls.push(att.space.host + "/gradio_api/file=" + rel);
+          urls.push(att.space.host + "/file=" + rel);
+        }
+        function tryUrl(i) {
+          phGuard(att);
+          if (i >= urls.length) return Promise.reject(new Error("couldn't download the finished model from the Space"));
+          return phFetch(att, urls[i], {}, 180000).then(function (res) {
+            if (!res.ok) return tryUrl(i + 1);
+            return res.arrayBuffer().then(function (buf) {
+              if (buf.byteLength < 100) return tryUrl(i + 1);
+              return { buf: buf, name: fileObj.orig_name || p };
+            });
+          });
+        }
+        return tryUrl(0);
+      }
+      /* Config-driven endpoint pick for generic Gradio Spaces: a dependency
+         that takes an image in and hands a 3D model / file back. A Generate
+         button among the inputs marks the real run action. */
+      function phPickDep(config) {
+        var comps = {};
+        (config.components || []).forEach(function (c) { comps[c.id] = c; });
+        var best = null;
+        (config.dependencies || []).forEach(function (dep, i) {
+          var ins = (dep.inputs || []).map(function (id) { return comps[id]; }).filter(Boolean);
+          var outs = (dep.outputs || []).map(function (id) { return comps[id]; }).filter(Boolean);
+          var hasImg = ins.some(function (c) { return c.type === "image" || c.type === "file"; });
+          var hasModel = outs.some(function (c) { return ["model3d", "litmodel3d", "file", "downloadbutton"].indexOf(c.type) >= 0; });
+          if (!hasImg || !hasModel) return;
+          var score = ins.length + (ins.some(function (c) { return c.type === "button"; }) ? 10 : 0);
+          if (!best || score > best.score) best = { index: i, dep: dep, score: score };
+        });
+        return best;
+      }
+      function phBuildData(config, dep, fileData) {
+        var comps = {};
+        (config.components || []).forEach(function (c) { comps[c.id] = c; });
+        return (dep.inputs || []).map(function (id) {
+          var c = comps[id];
+          if (!c) return null;
+          var props = c.props || {};
+          switch (c.type) {
+            case "image": case "file": return fileData;
+            case "state": case "button": return null;
+            case "checkbox": return !!props.value;
+            case "slider": case "number": return (typeof props.value === "number") ? props.value : 0;
+            case "radio": case "dropdown": return (props.value !== undefined && props.value !== null) ? props.value : null;
+            case "textbox": return props.value || "";
+            default: return (props.value !== undefined) ? props.value : null;
+          }
+        });
+      }
+      function phAttemptTrellis(file, att) {
+        var session = phHash();
+        var imgData = null, stateVal = null;
+        function keepGoing(e) { if (e && e.fatal) throw e; return null; }
+        return phWake(att, "/gradio_api/info")
+          .then(function () {
+            phStatus(att.space.name + ": starting a session");
+            return phCall(att, "start_session", [], session).then(function () { return null; }, keepGoing);
+          })
+          .then(function () {
+            phStatus(att.space.name + ": uploading your photo");
+            return phUpload(att, file, ["/gradio_api/upload", "/upload"]);
+          })
+          .then(function (path) {
+            imgData = { path: path, orig_name: file.name, meta: { _type: "gradio.FileData" } };
+            phStatus(att.space.name + ": cleaning up the photo (background removal)");
+            return phCall(att, "preprocess_image", [imgData], session).then(function (out) {
+              if (out && out[0]) imgData = out[0];
+              return null;
+            }, keepGoing);
+          })
+          .then(function () {
+            phStatus(att.space.name + ": generating the 3D model — the slow part");
+            return phCall(att, "image_to_3d", [imgData, 0, "1024", 7.5, 0.7, 12, 5.0, 7.5, 0.5, 12, 3.0, 1.0, 0.0, 12, 3.0], session);
+          })
+          .then(function (out) {
+            stateVal = (out && out.length) ? out[0] : null;
+            phStatus(att.space.name + ": extracting the GLB file");
+            return phCall(att, "extract_glb", [stateVal, 300000, 2048], session).then(function (o) { return o; }, function (e) {
+              if (e && e.fatal) throw e;
+              return phCall(att, "extract_glb", [300000, 2048], session);
+            });
+          })
+          .then(function (out) {
+            var files = []; phFindModelFiles(out, files);
+            var f = phPickFile(files);
+            if (!f) throw new Error("the Space finished but didn't hand back a model file");
+            phStatus(att.space.name + ": downloading the model");
+            return phDownload(att, f);
+          })
+          .then(function (got) { return { buf: got.buf, fmt: phFmtOf(got.name) }; });
+      }
+      function phAttemptGeneric(file, att) {
+        var session = phHash();
+        var config = null;
+        return phWake(att, "/config")
+          .then(function () {
+            return phFetch(att, att.space.host + "/config", {}, 30000).then(function (res) {
+              if (!res.ok) throw new Error("couldn't read the Space's setup (HTTP " + res.status + ")");
+              return res.json();
+            });
+          })
+          .then(function (cfg) {
+            config = cfg;
+            phStatus(att.space.name + ": uploading your photo");
+            return phUpload(att, file, ["/upload", "/gradio_api/upload"]);
+          })
+          .then(function (path) {
+            var pick = phPickDep(config);
+            if (!pick) throw new Error("couldn't find a generation action in this Space's layout");
+            var fileData = { path: path, orig_name: file.name, meta: { _type: "gradio.FileData" } };
+            var data = phBuildData(config, pick.dep, fileData);
+            phStatus(att.space.name + ": joining the queue");
+            return phQueue(att, pick.index, data, session, function (txt) { phStatus(att.space.name + ": " + txt); });
+          })
+          .then(function (out) {
+            var files = []; phFindModelFiles(out, files);
+            var f = phPickFile(files);
+            if (!f) throw new Error("the Space finished but returned no model file");
+            phStatus(att.space.name + ": downloading the model");
+            return phDownload(att, f);
+          })
+          .then(function (got) { return { buf: got.buf, fmt: phFmtOf(got.name) }; });
+      }
+
+      /* ================= GLB → triangle soup =================
+         Minimal binary-glTF reader: JSON + BIN chunks, accessors, node
+         transforms. glTF is Y-up; vertices are rotated into this tool's
+         Z-up world as they are emitted. */
+      function glbMatMul(a, b) {
+        var o = new Array(16);
+        for (var col = 0; col < 4; col++) for (var row = 0; row < 4; row++) {
+          var s = 0;
+          for (var k = 0; k < 4; k++) s += a[k * 4 + row] * b[col * 4 + k];
+          o[col * 4 + row] = s;
+        }
+        return o;
+      }
+      function glbQuatMat(q) {
+        var x = q[0], y = q[1], z = q[2], w = q[3];
+        var x2 = x + x, y2 = y + y, z2 = z + z;
+        var xx = x * x2, xy = x * y2, xz = x * z2;
+        var yy = y * y2, yz = y * z2, zz = z * z2;
+        var wx = w * x2, wy = w * y2, wz = w * z2;
+        return [1 - (yy + zz), xy + wz, xz - wy, 0,
+                xy - wz, 1 - (xx + zz), yz + wx, 0,
+                xz + wy, yz - wx, 1 - (xx + yy), 0,
+                0, 0, 0, 1];
+      }
+      function glbReadAccessor(gltf, binDv, accIdx) {
+        var acc = gltf.accessors[accIdx];
+        var bv = gltf.bufferViews[acc.bufferView || 0];
+        var compSize = { 5120: 1, 5121: 1, 5122: 2, 5123: 2, 5125: 4, 5126: 4 }[acc.componentType];
+        var numComp = { SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4, MAT2: 4, MAT3: 9, MAT4: 16 }[acc.type];
+        var stride = bv.byteStride || compSize * numComp;
+        var base = (bv.byteOffset || 0) + (acc.byteOffset || 0);
+        var out = new Array(acc.count * numComp);
+        var normDiv = { 5120: 127, 5121: 255, 5122: 32767, 5123: 65535 }[acc.componentType];
+        for (var i = 0; i < acc.count; i++) {
+          for (var c = 0; c < numComp; c++) {
+            var off = base + i * stride + c * compSize, v;
+            switch (acc.componentType) {
+              case 5126: v = binDv.getFloat32(off, true); break;
+              case 5125: v = binDv.getUint32(off, true); break;
+              case 5123: v = binDv.getUint16(off, true); break;
+              case 5121: v = binDv.getUint8(off); break;
+              case 5122: v = binDv.getInt16(off, true); break;
+              case 5120: v = binDv.getInt8(off); break;
+              default: v = 0;
+            }
+            if (acc.normalized && normDiv) v = Math.max(v / normDiv, -1);
+            out[i * numComp + c] = v;
+          }
+        }
+        return out;
+      }
+      function parseGLB(buffer) {
+        var dv = new DataView(buffer);
+        if (buffer.byteLength < 12 || dv.getUint32(0, true) !== 0x46546C67) throw new Error("the download wasn't a GLB file");
+        var off = 12, json = null, binOff = -1, binLen = 0;
+        while (off + 8 <= buffer.byteLength) {
+          var clen = dv.getUint32(off, true), ctype = dv.getUint32(off + 4, true);
+          if (ctype === 0x4E4F534A) json = JSON.parse(new TextDecoder("utf-8").decode(new Uint8Array(buffer, off + 8, clen)));
+          else if (ctype === 0x004E4942) { binOff = off + 8; binLen = clen; }
+          off += 8 + clen;
+        }
+        if (!json) throw new Error("the GLB is missing its JSON chunk");
+        if (json.extensionsRequired && json.extensionsRequired.indexOf("KHR_draco_mesh_compression") >= 0)
+          throw new Error("this GLB uses Draco compression, which this tool can't decode in the browser");
+        if (binOff < 0) throw new Error("the GLB is missing its geometry chunk");
+        var binDv = new DataView(buffer, binOff, binLen);
+        var soup = [];
+        var identity = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+        function localMat(node) {
+          if (node.matrix) return node.matrix.slice();
+          var t = node.translation || [0, 0, 0], r = node.rotation || [0, 0, 0, 1], s = node.scale || [1, 1, 1];
+          var m = glbQuatMat(r);
+          return [m[0] * s[0], m[1] * s[0], m[2] * s[0], 0,
+                  m[4] * s[1], m[5] * s[1], m[6] * s[1], 0,
+                  m[8] * s[2], m[9] * s[2], m[10] * s[2], 0,
+                  t[0], t[1], t[2], 1];
+        }
+        function addMesh(meshIdx, world) {
+          var mesh = json.meshes[meshIdx];
+          if (!mesh) return;
+          mesh.primitives.forEach(function (prim) {
+            if (prim.extensions && prim.extensions.KHR_draco_mesh_compression)
+              throw new Error("this GLB uses Draco compression, which this tool can't decode in the browser");
+            if (!prim.attributes || prim.attributes.POSITION === undefined) return;
+            var pos = glbReadAccessor(json, binDv, prim.attributes.POSITION);
+            var idx = (prim.indices !== undefined && prim.indices !== null) ? glbReadAccessor(json, binDv, prim.indices) : null;
+            var count = idx ? idx.length : pos.length / 3;
+            var mode = (prim.mode === undefined) ? 4 : prim.mode;
+            function vert(i) {
+              var vi = idx ? idx[i] : i;
+              var x = pos[vi * 3], y = pos[vi * 3 + 1], z = pos[vi * 3 + 2];
+              var wx = world[0] * x + world[4] * y + world[8] * z + world[12];
+              var wy = world[1] * x + world[5] * y + world[9] * z + world[13];
+              var wz = world[2] * x + world[6] * y + world[10] * z + world[14];
+              return [wx, -wz, wy]; // Y-up → Z-up (proper rotation)
+            }
+            var i;
+            if (mode === 4) { for (i = 0; i + 2 < count; i += 3) soup.push(vert(i), vert(i + 1), vert(i + 2)); }
+            else if (mode === 5) { for (i = 0; i + 2 < count; i++) { if (i % 2 === 0) soup.push(vert(i), vert(i + 1), vert(i + 2)); else soup.push(vert(i + 1), vert(i), vert(i + 2)); } }
+            else if (mode === 6) { for (i = 1; i + 1 < count; i++) soup.push(vert(0), vert(i), vert(i + 1)); }
+          });
+        }
+        function walk(nodeIdx, parent) {
+          var node = json.nodes[nodeIdx];
+          if (!node) return;
+          var world = glbMatMul(parent, localMat(node));
+          if (node.mesh !== undefined && node.mesh !== null) addMesh(node.mesh, world);
+          (node.children || []).forEach(function (c) { walk(c, world); });
+        }
+        var scenes = json.scenes || [{}];
+        var scene = scenes[json.scene || 0] || scenes[0];
+        (scene.nodes || []).forEach(function (n) { walk(n, identity); });
+        if (!soup.length && json.meshes) json.meshes.forEach(function (m, i) { addMesh(i, identity); });
+        return soup;
+      }
+      function phFinishModel(got, att) {
+        var soup;
+        if (got.fmt === "obj") soup = parseOBJ(new TextDecoder("utf-8").decode(got.buf));
+        else if (got.fmt === "stl") soup = parseSTL(got.buf);
+        else soup = parseGLB(got.buf);
+        if (!soup || soup.length < 3) throw new Error("the returned model had no usable geometry");
+        var mesh = weldMesh(soup);
+        if (!mesh.indices.length) throw new Error("the returned model had no usable triangles");
+        var bb = bboxOf(mesh.positions);
+        var maxDim = Math.max(bb.size[0], bb.size[1], bb.size[2]);
+        if (!(maxDim > 0)) throw new Error("the returned model was empty");
+        var s = 64 / maxDim; // AI models arrive in arbitrary units — normalise to a 64 mm clicker blank
+        mesh.positions.forEach(function (p) { p[0] *= s; p[1] *= s; p[2] *= s; });
+        setModel(mesh, att.baseName + " (full 3D)", mesh.indices.length);
+      }
+      function phEndRun() {
+        if (photoGen) { if (photoGen.timer) clearInterval(photoGen.timer); photoGen.running = false; }
+        $("photoBtn").disabled = false;
+        $("photoCancel").style.display = "none";
+        $("photoSpin").style.display = "none";
+      }
+      function startPhotoGen(file) {
+        if (photoGen && photoGen.running) { toast("A photo generation is already running"); return; }
+        $("photoPanel").style.display = "";
+        $("photoError").classList.remove("show"); $("photoError").innerHTML = "";
+        $("photoLog").innerHTML = "";
+        $("photoStatus").style.display = "";
+        $("photoSpin").style.display = "";
+        $("photoCancel").style.display = "";
+        $("photoBtn").disabled = true;
+        photoGen = { running: true, cancelled: false, t0: Date.now(), ctl: null, statusBase: "", timer: null };
+        photoGen.timer = setInterval(function () {
+          if (photoGen && photoGen.running) $("photoStatusText").textContent = photoGen.statusBase + " · " + phElapsed() + " elapsed";
+        }, 500);
+        var base = file.name.replace(/\.[^.]+$/, "").replace(/[^\w\- ]+/g, "").trim() || "photo";
+        var errors = [];
+        function cancelledOut() {
+          phEndRun();
+          $("photoStatusText").textContent = "Generation cancelled.";
+        }
+        function trySpace(i) {
+          if (!photoGen || photoGen.cancelled) { cancelledOut(); return; }
+          if (i >= PHOTO_SPACES.length) {
+            phEndRun();
+            $("photoStatusText").textContent = "All three free Spaces failed — the manual route below always works.";
+            var err = $("photoError");
+            err.innerHTML = "<b>None of the free Spaces could build this photo.</b><br>" + errors.map(function (x) { return escapeHtml(x); }).join("<br>") + "<br><br>Free Spaces are metered and shared, so trying again later often works. Or use the manual route below: generate on Meshy or Tripo's free tier, download the STL/OBJ, and open it here.";
+            err.classList.add("show");
+            return;
+          }
+          var space = PHOTO_SPACES[i];
+          var att = { space: space, deadline: Date.now() + space.budget, baseName: base };
+          phLog("Trying " + space.name + "…");
+          phStatus(space.name + ": contacting the Space");
+          var p;
+          try { p = space.kind === "trellis" ? phAttemptTrellis(file, att) : phAttemptGeneric(file, att); }
+          catch (e) { p = Promise.reject(e); }
+          p.then(function (got) {
+            if (!photoGen || photoGen.cancelled) { cancelledOut(); return; }
+            try { phFinishModel(got, att); }
+            catch (e) {
+              var m1 = space.name + ": the model it returned couldn't be used — " + phReadable(e);
+              errors.push(m1); phLog(m1);
+              trySpace(i + 1);
+              return;
+            }
+            phEndRun();
+            $("photoStatusText").textContent = "Done — " + space.name + " built your model. It's in the viewer with the cutter placed; carry on at step 2.";
+            phLog("Success via " + space.name + ".");
+            toast("Full 3D model loaded — cutter placed at its centre");
+          }, function (e) {
+            if (!photoGen || photoGen.cancelled) { cancelledOut(); return; }
+            var m2 = space.name + " didn't work — " + phReadable(e);
+            errors.push(m2); phLog(m2);
+            trySpace(i + 1);
+          });
+        }
+        trySpace(0);
+      }
+
       /* ================= fit warning ================= */
       function updateFitWarning() {
         if (!state.mesh) { $("fitRow").style.display = "none"; return; }
@@ -1204,6 +1778,16 @@
         $("imgInput").addEventListener("change", function () {
           if (this.files && this.files[0]) loadImageFile(this.files[0]);
           this.value = "";
+        });
+        $("photoBtn").addEventListener("click", function () { $("photoInput").click(); });
+        $("photoInput").addEventListener("change", function () {
+          if (this.files && this.files[0]) startPhotoGen(this.files[0]);
+          this.value = "";
+        });
+        $("photoCancel").addEventListener("click", function () {
+          if (!photoGen) return;
+          photoGen.cancelled = true;
+          if (photoGen.ctl) { try { photoGen.ctl.abort(); } catch (e) {} }
         });
         function bindImgParam(rangeId, numId, key) {
           var range = $(rangeId), num = $(numId);

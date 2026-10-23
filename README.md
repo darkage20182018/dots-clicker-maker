@@ -6,6 +6,7 @@ Free and open-source, fully client-side tool that turns any 3D model or image in
 
 - Upload any STL (binary or ASCII) or OBJ model
 - Or upload an image (PNG, JPG, WebP) and turn it into a raised relief plaque clicker
+- Or turn a photo into a full 3D model, free, via public Hugging Face Spaces (no account or key; TRELLIS.2 first, then Stable Fast 3D and TripoSR; free use is capped at roughly 1-2 heavy generations per person per day)
 - Parametric snap-click cutter: size 8-30 mm, finger thickness, lip depth, clearance
 - Auto-placement at mid-height, auto-scale for small models (applied scale shown)
 - Move the cutter with X/Y/Z steppers, numeric inputs, or drag
@@ -16,7 +17,7 @@ Free and open-source, fully client-side tool that turns any 3D model or image in
 
 ## Use
 
-Open `index.html` in any modern browser. No install, no signup, no server. Your model never leaves your computer.
+Open `index.html` in any modern browser. No install, no signup, no server. Your model never leaves your computer, except the optional Photo to full 3D step, which sends your photo to a public Hugging Face Space to generate the model.
 
 ## License
 
